@@ -65,13 +65,13 @@ def setup_model_and_tokenizer(model_path="/model/ModelScope/Qwen/Qwen3-8B"):
         padding_side="right"
     )
     
-    # 加载模型
+    # 加载模型 - 移除不支持的参数
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         device_map="auto" if torch.cuda.is_available() else None,
-        trust_remote_code=True,
-        use_flash_attention_2=False  # 如果遇到attention相关问题可以设为False
+        trust_remote_code=True
+        # 移除 use_flash_attention_2 参数
     )
     
     # 确保有pad token
@@ -201,7 +201,7 @@ def test_model(model_path, question):
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_path, 
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,  # 修改为 dtype
         device_map="auto",
         trust_remote_code=True
     )
