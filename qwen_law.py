@@ -43,22 +43,18 @@ def process_dataset_in_parallel(batch, tokenizer, max_length=2048):
     if not texts:
         return {"input_ids": [], "attention_mask": [], "labels": []}
     
-    # 3. 修复：不在预处理时进行padding，让数据整理器处理
+    # 3. 修复：进行tokenization但确保返回正确格式
     tokenized = tokenizer(
         texts,
         truncation=True,
-        padding=False,  # 修复：关闭padding
+        padding=False,  # 关闭padding
         max_length=max_length,
         return_tensors=None,
         verbose=False
     )
     
-    # 4. 确保labels的格式正确
-    tokenized['labels'] = []
-    for input_ids in tokenized['input_ids']:
-        labels = input_ids.copy()
-        # 不需要处理pad token，因为没有padding
-        tokenized['labels'].append(labels)
+    # 4. 修复：确保labels是与input_ids相同的格式
+    tokenized['labels'] = tokenized['input_ids'].copy()  # 直接复制
     
     return tokenized
 
@@ -73,14 +69,12 @@ def setup_model_and_tokenizer(model_path):
         use_fast=True,
     )
     
-    # 关键优化：启用更多并行计算选项
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         device_map="auto" if torch.cuda.is_available() else None,
         trust_remote_code=True,
         low_cpu_mem_usage=True,
-        # 移除 attn_implementation，让模型自动选择最优实现
     )
     
     if tokenizer.pad_token is None:
@@ -102,8 +96,53 @@ def setup_lora_config():
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     )
 
+class CustomDataCollatorForCausalLM:
+    """自定义数据整理器，确保正确处理padding和多核兼容"""
+    
+    def __init__(self, tokenizer, pad_to_multiple_of=None):
+        self.tokenizer = tokenizer
+        self.pad_to_multiple_of = pad_to_multiple_of
+
+    def __call__(self, features):
+        batch = {}
+        
+        # 获取最大长度
+        max_length = max(len(f["input_ids"]) for f in features)
+        if self.pad_to_multiple_of:
+            max_length = ((max_length + self.pad_to_multiple_of - 1) // self.pad_to_multiple_of) * self.pad_to_multiple_of
+        
+        batch_input_ids = []
+        batch_attention_mask = []
+        batch_labels = []
+        
+        for f in features:
+            input_ids = f["input_ids"]
+            attention_mask = f["attention_mask"] 
+            labels = f["labels"]
+            
+            # 手动padding
+            padding_length = max_length - len(input_ids)
+            
+            # Pad input_ids
+            padded_input_ids = input_ids + [self.tokenizer.pad_token_id] * padding_length
+            batch_input_ids.append(padded_input_ids)
+            
+            # Pad attention_mask
+            padded_attention_mask = attention_mask + [0] * padding_length
+            batch_attention_mask.append(padded_attention_mask)
+            
+            # Pad labels (用-100填充padding位置)
+            padded_labels = labels + [-100] * padding_length
+            batch_labels.append(padded_labels)
+        
+        batch["input_ids"] = torch.tensor(batch_input_ids, dtype=torch.long)
+        batch["attention_mask"] = torch.tensor(batch_attention_mask, dtype=torch.long)
+        batch["labels"] = torch.tensor(batch_labels, dtype=torch.long)
+        
+        return batch
+
 def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", output_dir="./qwen_fine_tuned_model"):
-    """主要的微调函数 - 高度优化版本"""
+    """主要的微调函数 - 稳定优化版本"""
     
     # 关键优化：设置多线程环境变量
     cpu_count = mp.cpu_count()
@@ -119,12 +158,6 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
     # PyTorch 线程设置
     torch.set_num_threads(cpu_count)
     torch.set_num_interop_threads(cpu_count)
-    
-    # 启用 PyTorch 的多线程优化
-    if hasattr(torch.backends.mkldnn, 'enabled'):
-        torch.backends.mkldnn.enabled = True
-    if hasattr(torch.backends.mkldnn, 'set_num_threads'):
-        torch.backends.mkldnn.set_num_threads(cpu_count)
     
     print(f"设置CPU线程数: {cpu_count}")
     print("加载Qwen模型和tokenizer...")
@@ -173,6 +206,8 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
     print(f"样本字段: {list(sample.keys())}")
     print(f"input_ids长度: {len(sample['input_ids'])}")
     print(f"labels长度: {len(sample['labels'])}")
+    print(f"input_ids类型: {type(sample['input_ids'])}")
+    print(f"labels类型: {type(sample['labels'])}")
     
     if len(tokenized_dataset) > 10:
         train_test_split = tokenized_dataset.train_test_split(test_size=0.1, seed=42)
@@ -182,16 +217,16 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
         train_dataset = tokenized_dataset
         eval_dataset = None
     
-    # 关键优化：重新启用数据加载器的多线程
-    dataloader_workers = max(2, min(8, cpu_count // 2))  # 使用合适的worker数量
+    # 先尝试单进程数据加载器，确保稳定性
+    print("使用稳定的训练配置...")
     
     training_args = TrainingArguments(
         output_dir=output_dir,
         overwrite_output_dir=True,
         num_train_epochs=3,
-        per_device_train_batch_size=2,  # 增加批处理大小
+        per_device_train_batch_size=2,  
         per_device_eval_batch_size=2,
-        gradient_accumulation_steps=8,  # 相应减少梯度累积
+        gradient_accumulation_steps=8,  
         warmup_steps=100,
         learning_rate=5e-5,
         weight_decay=0.01,
@@ -207,11 +242,9 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
         metric_for_best_model="eval_loss" if eval_dataset else None,
         report_to=None,
         
-        # 关键优化：重新启用并优化数据加载器
-        dataloader_pin_memory=True,
-        dataloader_num_workers=dataloader_workers,  # 重新启用多worker
-        dataloader_persistent_workers=True,  # 保持worker活跃
-        dataloader_prefetch_factor=2,  # 预取数据
+        # 暂时使用单进程数据加载器确保稳定
+        dataloader_pin_memory=False,
+        dataloader_num_workers=0,  # 先设为0确保稳定
         
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={'use_reentrant': False},
@@ -220,20 +253,14 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
         max_grad_norm=1.0,
         lr_scheduler_type="cosine",
         warmup_ratio=0.1,
-        
-        # 修复：移除冲突的选项
-        group_by_length=False,  # 修复：禁用按长度分组
-        auto_find_batch_size=False,  # 禁用自动批大小查找以提升性能
+        group_by_length=False,
+        auto_find_batch_size=False,
     )
     
-    print(f"数据加载器将使用 {dataloader_workers} 个worker进程")
-    
-    # 使用标准数据整理器
-    data_collator = DataCollatorForLanguageModeling(
+    # 使用自定义数据整理器
+    data_collator = CustomDataCollatorForCausalLM(
         tokenizer=tokenizer,
-        mlm=False,
-        pad_to_multiple_of=8,  # 重新启用，有助于性能
-        return_tensors="pt",
+        pad_to_multiple_of=8
     )
     
     trainer = Trainer(
