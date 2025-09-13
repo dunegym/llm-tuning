@@ -243,7 +243,7 @@ def test_model(model_path, question):
 
 if __name__ == "__main__":
     # 使用示例
-    xlsx_file_path = "law_qa.xlsx"  # 替换为您的xlsx文件路径
+    xlsx_file_path = "/data/llm/law_qa.xlsx"  # 替换为您的xlsx文件路径
     model_path = "/model/ModelScope/Qwen/Qwen3-8B"  # 本地模型路径
     
     try:
