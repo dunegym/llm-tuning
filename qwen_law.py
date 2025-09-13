@@ -9,47 +9,42 @@ from transformers import (
     DataCollatorForLanguageModeling
 )
 from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
-import json
+from functools import partial
 
-def load_and_prepare_data(xlsx_path, tokenizer):
-    """加载xlsx文件并准备数据"""
-    df = pd.read_excel(xlsx_path)
-    
-    # 确保列名正确
-    if 'question' not in df.columns or 'answer' not in df.columns:
-        raise ValueError("Excel文件必须包含'question'和'answer'两列")
-    
-    # 使用tokenizer自动生成对话格式
-    texts = []
-    for _, row in df.iterrows():
-        # 构建对话消息格式
+def process_dataset_in_parallel(batch, tokenizer, max_length=2048):
+    """
+    并行处理函数：将构建prompt和tokenize合并，以充分利用多核CPU。
+    'batch' 是一个批次的数据，格式为字典。
+    """
+    # 1. 批量构建对话消息格式
+    messages_list = []
+    for question, answer in zip(batch['question'], batch['answer']):
         messages = [
-            {"role": "user", "content": str(row['question'])},
-            {"role": "assistant", "content": str(row['answer'])}
+            {"role": "user", "content": str(question)},
+            {"role": "assistant", "content": str(answer)}
         ]
-        
-        # 使用tokenizer的apply_chat_template自动生成prompt
-        text = tokenizer.apply_chat_template(
+        messages_list.append(messages)
+
+    # 2. 批量应用聊天模板
+    # 注意：这里不直接tokenize，以保持与原逻辑一致，先生成文本
+    texts = [
+        tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=False
-        )
-        texts.append(text)
+        ) for messages in messages_list
+    ]
     
-    return texts
-
-def tokenize_function(examples, tokenizer, max_length=2048):
-    """数据tokenization - 修复batch处理问题"""
-    # 对文本进行tokenization，不返回tensor
+    # 3. 批量进行tokenization
     tokenized = tokenizer(
-        examples['text'],
+        texts,
         truncation=True,
-        padding=False,  # 先不padding，让data collator处理
+        padding=False,
         max_length=max_length,
-        return_tensors=None  # 不返回tensor，返回list
+        return_tensors=None
     )
     
-    # 对于因果语言模型，标签就是输入的copy
+    # 4. 标签就是输入的copy
     tokenized['labels'] = tokenized['input_ids'].copy()
     
     return tokenized
@@ -58,92 +53,72 @@ def setup_model_and_tokenizer(model_path):
     """从本地路径设置模型和tokenizer"""
     print(f"从本地路径加载模型: {model_path}")
     
-    # 加载tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
         trust_remote_code=True,
         padding_side="right"
     )
     
-    # 加载模型
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         device_map="auto" if torch.cuda.is_available() else None,
         trust_remote_code=True,
-        attn_implementation="flash_attention_2"  # 修正：使用新的标准参数启用Flash Attention 2
+        attn_implementation="flash_attention_2"
     )
     
-    # 确保有pad token
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     
-    # 准备模型进行训练 - 这很重要！
     model = prepare_model_for_kbit_training(model)
     
     return model, tokenizer
 
 def setup_lora_config():
-    """设置LoRA配置 - 适配Qwen模型"""
-    lora_config = LoraConfig(
+    """设置LoRA配置"""
+    return LoraConfig(
         task_type=TaskType.CAUSAL_LM,
-        r=16,  # 降低rank以减少显存占用
-        lora_alpha=32, # lora_alpha通常是r的两倍
+        r=16,
+        lora_alpha=32,
         lora_dropout=0.1,
         bias="none",
-        # Qwen模型的attention层名称
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     )
-    return lora_config
 
 def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", output_dir="./qwen_fine_tuned_model"):
     """主要的微调函数"""
     
-    # 1. 先设置模型和tokenizer
     print("加载Qwen模型和tokenizer...")
     model, tokenizer = setup_model_and_tokenizer(model_path)
     
-    # 2. 应用LoRA（在数据处理前应用LoRA）
     print("应用LoRA配置...")
     lora_config = setup_lora_config()
     model = get_peft_model(model, lora_config)
-    
-    # 打印可训练参数数量
     model.print_trainable_parameters()
-    
-    # 确保模型参数可训练
     model.train()
-    for param in model.parameters():
-        if param.requires_grad:
-            param.data = param.data.to(torch.bfloat16 if torch.cuda.is_available() else torch.float32)
     
-    # 3. 加载数据（传入tokenizer用于生成prompt）
+    # --- 数据处理流程重构 ---
     print("加载数据...")
-    texts = load_and_prepare_data(xlsx_path, tokenizer)
-    print(f"加载了 {len(texts)} 条训练数据")
-    
-    # 打印第一个样本查看格式
-    print(f"样本格式预览:\n{texts[0][:200]}...")
-    
-    # 4. 创建Dataset
-    dataset = Dataset.from_dict({"text": texts})
-    
-    # 5. Tokenize数据
-    print("处理数据...")
-    def tokenize_function_wrapper(examples):
-        return tokenize_function(examples, tokenizer, max_length=2048)
-    
+    df = pd.read_excel(xlsx_path)
+    if 'question' not in df.columns or 'answer' not in df.columns:
+        raise ValueError("Excel文件必须包含'question'和'answer'两列")
+    dataset = Dataset.from_pandas(df)
+    print(f"加载了 {len(dataset)} 条原始数据")
+
+    print("开始并行处理和Tokenize数据...")
+    process_fn = partial(process_dataset_in_parallel, tokenizer=tokenizer, max_length=2048)
+
     tokenized_dataset = dataset.map(
-        tokenize_function_wrapper, 
+        process_fn,
         batched=True,
         batch_size=1000,
-        num_proc=4,  # 使用4个CPU核心并行处理数据
+        num_proc=4,  # 使用4个CPU核心并行处理
         remove_columns=dataset.column_names,
-        desc="Tokenizing dataset"
+        desc="Processing and Tokenizing dataset"
     )
-    
-    # 6. 分割训练和验证集
+    # --- 数据处理流程结束 ---
+
     if len(tokenized_dataset) > 10:
         train_test_split = tokenized_dataset.train_test_split(test_size=0.1)
         train_dataset = train_test_split['train']
@@ -152,18 +127,17 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
         train_dataset = tokenized_dataset
         eval_dataset = None
     
-    # 7. 设置训练参数
     training_args = TrainingArguments(
         output_dir=output_dir,
         overwrite_output_dir=True,
         num_train_epochs=3,
-        per_device_train_batch_size=1,  # 降低batch size适应显存
+        per_device_train_batch_size=1,
         per_device_eval_batch_size=1,
-        gradient_accumulation_steps=16,  # 增加梯度累积步数以补偿batch_size
+        gradient_accumulation_steps=16,
         warmup_steps=100,
-        learning_rate=5e-5,  # 降低学习率
+        learning_rate=5e-5,
         weight_decay=0.01,
-        bf16=torch.cuda.is_available(),  # 使用bf16代替fp16
+        bf16=torch.cuda.is_available(),
         logging_steps=10,
         logging_dir=f'{output_dir}/logs',
         eval_strategy="steps" if eval_dataset else "no",
@@ -173,44 +147,39 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
         load_best_model_at_end=True if eval_dataset else False,
         metric_for_best_model="eval_loss" if eval_dataset else None,
         report_to=None,
-        dataloader_pin_memory=True, # 锁定内存以加速数据传输
-        dataloader_num_workers=4, # 使用4个worker加载数据
-        gradient_checkpointing=True,  # 启用梯度检查点以节省显存
-        gradient_checkpointing_kwargs={'use_reentrant': False}, # 推荐与PEFT一起使用
-        remove_unused_columns=True, # 推荐设置为True
+        dataloader_pin_memory=True,
+        dataloader_num_workers=4,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={'use_reentrant': False},
+        remove_unused_columns=True,
         ddp_find_unused_parameters=False,
     )
     
-    # 8. 设置数据整理器
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=False,
         pad_to_multiple_of=8,
     )
     
-    # 9. 创建Trainer
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
-        processing_class=tokenizer,  # 使用新的参数名
     )
     
-    # 10. 开始训练
     print("开始微调...")
     trainer.train()
     
-    # 11. 保存模型
     print(f"保存模型到 {output_dir}")
     trainer.save_model()
     tokenizer.save_pretrained(output_dir)
     
     print("微调完成!")
-    
     return model, tokenizer
 
+# test_model 函数保持不变...
 def test_model(model_path, question):
     """测试微调后的模型"""
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -221,7 +190,6 @@ def test_model(model_path, question):
         trust_remote_code=True
     )
     
-    # 使用tokenizer自动生成prompt格式
     messages = [{"role": "user", "content": question}]
     input_text = tokenizer.apply_chat_template(
         messages,
@@ -229,51 +197,36 @@ def test_model(model_path, question):
         add_generation_prompt=True
     )
     
-    input_ids = tokenizer.encode(input_text, return_tensors='pt')
+    input_ids = tokenizer.encode(input_text, return_tensors='pt').to(model.device)
     
-    if torch.cuda.is_available():
-        input_ids = input_ids.cuda()
-    
-    # 生成回答
     with torch.no_grad():
         output = model.generate(
             input_ids,
             max_new_tokens=512,
-            num_return_sequences=1,
-            temperature=0.7,
-            do_sample=True,
-            top_p=0.9,
-            repetition_penalty=1.1,
             pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id
         )
     
-    # 解码输出
-    generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-    
-    # 提取新生成的部分
-    answer = generated_text[len(input_text):].strip()
+    response_text = tokenizer.decode(output[0], skip_special_tokens=True)
+    # 简单地从用户输入之后开始截取
+    answer_start_index = response_text.rfind(question) + len(question)
+    answer = response_text[answer_start_index:].strip()
     
     return answer
 
 if __name__ == "__main__":
-    # 使用示例
-    xlsx_file_path = "/cloud/cloud-ssd1/llm/law_qa.xlsx"  # 替换为您的xlsx文件路径
-    model_path = "/model/ModelScope/Qwen/Qwen3-4B"  # 本地模型路径
+    xlsx_file_path = "/cloud/cloud-ssd1/llm/law_qa.xlsx"
+    model_path = "/model/ModelScope/Qwen/Qwen3-4B"
 
     try:
-        # 进行微调
         model, tokenizer = fine_tune_model(
             xlsx_path=xlsx_file_path,
             model_path=model_path,
             output_dir="./qwen_fine_tuned_model"
         )
         
-        # 测试模型
         test_question = "什么是合同法？"
         answer = test_model("./qwen_fine_tuned_model", test_question)
-        print(f"问题: {test_question}")
-        print(f"回答: {answer}")
+        print(f"\n--- 测试模型 ---\n问题: {test_question}\n回答: {answer}")
         
     except Exception as e:
         print(f"错误: {e}")
