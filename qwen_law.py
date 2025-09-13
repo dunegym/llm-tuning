@@ -54,7 +54,7 @@ def tokenize_function(examples, tokenizer, max_length=2048):
     
     return tokenized
 
-def setup_model_and_tokenizer(model_path="/model/ModelScope/Qwen/Qwen3-8B"):
+def setup_model_and_tokenizer(model_path):
     """从本地路径设置模型和tokenizer"""
     print(f"从本地路径加载模型: {model_path}")
     
@@ -254,9 +254,9 @@ def test_model(model_path, question):
 
 if __name__ == "__main__":
     # 使用示例
-    xlsx_file_path = "/data/llm/law_qa.xlsx"  # 替换为您的xlsx文件路径
-    model_path = "/model/ModelScope/Qwen/Qwen3-8B"  # 本地模型路径
-    
+    xlsx_file_path = "/cloud/cloud-ssd1/llm/law_qa.xlsx"  # 替换为您的xlsx文件路径
+    model_path = "/model/ModelScope/Qwen/Qwen3-4B"  # 本地模型路径
+
     try:
         # 进行微调
         model, tokenizer = fine_tune_model(
