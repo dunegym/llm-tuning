@@ -70,7 +70,8 @@ def setup_model_and_tokenizer(model_path):
         model_path,
         dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         device_map="auto" if torch.cuda.is_available() else None,
-        trust_remote_code=True
+        trust_remote_code=True,
+        use_flash_attention_2=True  # 启用Flash Attention 2
     )
     
     # 确保有pad token
@@ -136,7 +137,8 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
     tokenized_dataset = dataset.map(
         tokenize_function_wrapper, 
         batched=True,
-        batch_size=1000,  # 减小batch size
+        batch_size=1000,
+        num_proc=4,  # 使用4个CPU核心并行处理数据
         remove_columns=dataset.column_names,
         desc="Tokenizing dataset"
     )
@@ -171,10 +173,11 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
         load_best_model_at_end=True if eval_dataset else False,
         metric_for_best_model="eval_loss" if eval_dataset else None,
         report_to=None,
-        dataloader_pin_memory=False,
+        dataloader_pin_memory=True, # 锁定内存以加速数据传输
+        dataloader_num_workers=4, # 使用4个worker加载数据
         gradient_checkpointing=True,  # 启用梯度检查点以节省显存
         gradient_checkpointing_kwargs={'use_reentrant': False}, # 推荐与PEFT一起使用
-        remove_unused_columns=False,
+        remove_unused_columns=True, # 推荐设置为True
         ddp_find_unused_parameters=False,
     )
     
