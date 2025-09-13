@@ -8,7 +8,7 @@ from transformers import (
     Trainer,
     DataCollatorForLanguageModeling
 )
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 import json
 
 def load_and_prepare_data(xlsx_path, tokenizer):
@@ -65,13 +65,12 @@ def setup_model_and_tokenizer(model_path="/model/ModelScope/Qwen/Qwen3-8B"):
         padding_side="right"
     )
     
-    # 加载模型 - 移除不支持的参数
+    # 加载模型
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         device_map="auto" if torch.cuda.is_available() else None,
         trust_remote_code=True
-        # 移除 use_flash_attention_2 参数
     )
     
     # 确保有pad token
@@ -79,15 +78,18 @@ def setup_model_and_tokenizer(model_path="/model/ModelScope/Qwen/Qwen3-8B"):
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     
+    # 准备模型进行训练 - 这很重要！
+    model = prepare_model_for_kbit_training(model)
+    
     return model, tokenizer
 
 def setup_lora_config():
     """设置LoRA配置 - 适配Qwen模型"""
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
-        r=64,  # 适当增加rank以提高微调效果
-        lora_alpha=128,
-        lora_dropout=0.05,
+        r=32,  # 降低rank避免显存问题
+        lora_alpha=64,
+        lora_dropout=0.1,
         bias="none",
         # Qwen模型的attention层名称
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
@@ -101,18 +103,7 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
     print("加载Qwen模型和tokenizer...")
     model, tokenizer = setup_model_and_tokenizer(model_path)
     
-    # 2. 加载数据（传入tokenizer用于生成prompt）
-    print("加载数据...")
-    texts = load_and_prepare_data(xlsx_path, tokenizer)
-    print(f"加载了 {len(texts)} 条训练数据")
-    
-    # 打印第一个样本查看格式
-    print(f"样本格式预览:\n{texts[0][:200]}...")
-    
-    # 3. 创建Dataset
-    dataset = Dataset.from_dict({"text": texts})
-    
-    # 4. 应用LoRA
+    # 2. 应用LoRA（在数据处理前应用LoRA）
     print("应用LoRA配置...")
     lora_config = setup_lora_config()
     model = get_peft_model(model, lora_config)
@@ -120,7 +111,24 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
     # 打印可训练参数数量
     model.print_trainable_parameters()
     
-    # 5. Tokenize数据 - 修改为不使用batched处理
+    # 确保模型参数可训练
+    model.train()
+    for param in model.parameters():
+        if param.requires_grad:
+            param.data = param.data.to(torch.bfloat16 if torch.cuda.is_available() else torch.float32)
+    
+    # 3. 加载数据（传入tokenizer用于生成prompt）
+    print("加载数据...")
+    texts = load_and_prepare_data(xlsx_path, tokenizer)
+    print(f"加载了 {len(texts)} 条训练数据")
+    
+    # 打印第一个样本查看格式
+    print(f"样本格式预览:\n{texts[0][:200]}...")
+    
+    # 4. 创建Dataset
+    dataset = Dataset.from_dict({"text": texts})
+    
+    # 5. Tokenize数据
     print("处理数据...")
     def tokenize_function_wrapper(examples):
         return tokenize_function(examples, tokenizer, max_length=2048)
@@ -142,7 +150,7 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
         train_dataset = tokenized_dataset
         eval_dataset = None
     
-    # 7. 设置训练参数 - 修复参数名称
+    # 7. 设置训练参数
     training_args = TrainingArguments(
         output_dir=output_dir,
         overwrite_output_dir=True,
@@ -151,12 +159,12 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
         per_device_eval_batch_size=1,
         gradient_accumulation_steps=8,  # 增加梯度累积步数
         warmup_steps=100,
-        learning_rate=1e-4,  # 适当降低学习率
+        learning_rate=5e-5,  # 降低学习率
         weight_decay=0.01,
         bf16=torch.cuda.is_available(),  # 使用bf16代替fp16
         logging_steps=10,
         logging_dir=f'{output_dir}/logs',
-        eval_strategy="steps" if eval_dataset else "no",  # 修改为 eval_strategy
+        eval_strategy="steps" if eval_dataset else "no",
         eval_steps=100 if eval_dataset else None,
         save_steps=100,
         save_total_limit=2,
@@ -164,11 +172,12 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
         metric_for_best_model="eval_loss" if eval_dataset else None,
         report_to=None,
         dataloader_pin_memory=False,
-        gradient_checkpointing=True,  # 启用梯度检查点以节省显存
+        gradient_checkpointing=False,  # 暂时关闭梯度检查点
         remove_unused_columns=False,
+        ddp_find_unused_parameters=False,
     )
     
-    # 8. 设置数据整理器 - 这里会处理padding
+    # 8. 设置数据整理器
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=False,
@@ -182,7 +191,7 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,  # 使用新的参数名
     )
     
     # 10. 开始训练
@@ -203,7 +212,7 @@ def test_model(model_path, question):
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_path, 
-        dtype=torch.bfloat16,  # 修改为 dtype
+        dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True
     )
