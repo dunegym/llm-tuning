@@ -142,7 +142,7 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
         train_dataset = tokenized_dataset
         eval_dataset = None
     
-    # 7. 设置训练参数
+    # 7. 设置训练参数 - 修复参数名称
     training_args = TrainingArguments(
         output_dir=output_dir,
         overwrite_output_dir=True,
@@ -156,7 +156,7 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
         bf16=torch.cuda.is_available(),  # 使用bf16代替fp16
         logging_steps=10,
         logging_dir=f'{output_dir}/logs',
-        evaluation_strategy="steps" if eval_dataset else "no",
+        eval_strategy="steps" if eval_dataset else "no",  # 修改为 eval_strategy
         eval_steps=100 if eval_dataset else None,
         save_steps=100,
         save_total_limit=2,
