@@ -71,7 +71,7 @@ def setup_model_and_tokenizer(model_path):
         dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         device_map="auto" if torch.cuda.is_available() else None,
         trust_remote_code=True,
-        use_flash_attention_2=True  # 启用Flash Attention 2
+        attn_implementation="flash_attention_2"  # 修正：使用新的标准参数启用Flash Attention 2
     )
     
     # 确保有pad token
