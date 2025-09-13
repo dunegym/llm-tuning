@@ -43,11 +43,11 @@ def process_dataset_in_parallel(batch, tokenizer, max_length=2048):
     if not texts:
         return {"input_ids": [], "attention_mask": [], "labels": []}
     
-    # 3. 批量进行tokenization
+    # 3. 修复：不在预处理时进行padding，让数据整理器处理
     tokenized = tokenizer(
         texts,
         truncation=True,
-        padding=True,
+        padding=False,  # 修复：关闭padding
         max_length=max_length,
         return_tensors=None,
         verbose=False
@@ -57,7 +57,7 @@ def process_dataset_in_parallel(batch, tokenizer, max_length=2048):
     tokenized['labels'] = []
     for input_ids in tokenized['input_ids']:
         labels = input_ids.copy()
-        labels = [label if label != tokenizer.pad_token_id else -100 for label in labels]
+        # 不需要处理pad token，因为没有padding
         tokenized['labels'].append(labels)
     
     return tokenized
@@ -221,9 +221,8 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
         lr_scheduler_type="cosine",
         warmup_ratio=0.1,
         
-        # 额外优化选项
-        group_by_length=True,  # 按长度分组减少padding
-        length_column_name="input_ids",  # 指定长度列
+        # 修复：移除冲突的选项
+        group_by_length=False,  # 修复：禁用按长度分组
         auto_find_batch_size=False,  # 禁用自动批大小查找以提升性能
     )
     
