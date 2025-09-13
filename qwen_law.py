@@ -87,8 +87,8 @@ def setup_lora_config():
     """设置LoRA配置 - 适配Qwen模型"""
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
-        r=32,  # 降低rank避免显存问题
-        lora_alpha=64,
+        r=16,  # 降低rank以减少显存占用
+        lora_alpha=32, # lora_alpha通常是r的两倍
         lora_dropout=0.1,
         bias="none",
         # Qwen模型的attention层名称
@@ -157,7 +157,7 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
         num_train_epochs=3,
         per_device_train_batch_size=1,  # 降低batch size适应显存
         per_device_eval_batch_size=1,
-        gradient_accumulation_steps=8,  # 增加梯度累积步数
+        gradient_accumulation_steps=16,  # 增加梯度累积步数以补偿batch_size
         warmup_steps=100,
         learning_rate=5e-5,  # 降低学习率
         weight_decay=0.01,
@@ -172,7 +172,8 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
         metric_for_best_model="eval_loss" if eval_dataset else None,
         report_to=None,
         dataloader_pin_memory=False,
-        gradient_checkpointing=False,  # 暂时关闭梯度检查点
+        gradient_checkpointing=True,  # 启用梯度检查点以节省显存
+        gradient_checkpointing_kwargs={'use_reentrant': False}, # 推荐与PEFT一起使用
         remove_unused_columns=False,
         ddp_find_unused_parameters=False,
     )
