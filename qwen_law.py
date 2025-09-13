@@ -25,7 +25,7 @@ def process_dataset_in_parallel(batch, tokenizer, max_length=2048):
         ]
         messages_list.append(messages)
 
-    # 2. 批量应用聊天模板 - 优化：增加批处理大小
+    # 2. 批量应用聊天模板
     texts = []
     for messages in messages_list:
         try:
@@ -42,18 +42,24 @@ def process_dataset_in_parallel(batch, tokenizer, max_length=2048):
     if not texts:
         return {"input_ids": [], "attention_mask": [], "labels": []}
     
-    # 3. 批量进行tokenization - 优化：启用并行处理
+    # 3. 批量进行tokenization - 修复：确保padding=True
     tokenized = tokenizer(
         texts,
         truncation=True,
-        padding=False,
+        padding=True,  # 修复：启用padding确保长度一致
         max_length=max_length,
         return_tensors=None,
-        verbose=False  # 减少输出
+        verbose=False
     )
     
-    # 4. 标签就是输入的copy
-    tokenized['labels'] = [ids.copy() for ids in tokenized['input_ids']]
+    # 4. 修复：确保labels的格式正确
+    tokenized['labels'] = []
+    for input_ids in tokenized['input_ids']:
+        # 创建labels，对pad token使用-100（忽略损失计算）
+        labels = input_ids.copy()
+        # 将pad token的位置设为-100
+        labels = [label if label != tokenizer.pad_token_id else -100 for label in labels]
+        tokenized['labels'].append(labels)
     
     return tokenized
 
@@ -130,10 +136,10 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
     print("开始并行处理和Tokenize数据...")
     process_fn = partial(process_dataset_in_parallel, tokenizer=tokenizer, max_length=2048)
 
-    # 优化：增加批处理大小和使用更多CPU核心
+    # 优化：调整批处理大小，减少内存压力
     cpu_count = os.cpu_count()
-    batch_size = max(500, 1000)  # 根据内存情况调整
-    num_proc = max(1, cpu_count - 1)  # 保留一个核心给系统
+    batch_size = 100  # 减少批处理大小以避免内存问题
+    num_proc = max(1, min(4, cpu_count - 1))  # 限制进程数避免过度并行
     
     print(f"使用 {num_proc} 个CPU核心，批处理大小: {batch_size}")
     
@@ -144,12 +150,19 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
         num_proc=num_proc,
         remove_columns=dataset.column_names,
         desc="Processing and Tokenizing dataset",
-        writer_batch_size=batch_size,  # 优化写入批处理大小
-        keep_in_memory=True,  # 如果内存足够，保持在内存中
+        writer_batch_size=1000,
+        keep_in_memory=False,  # 修复：避免内存不足
     )
     # --- 数据处理流程结束 ---
 
     print(f"Tokenized数据集大小: {len(tokenized_dataset)}")
+    
+    # 修复：检查数据集的格式
+    print("检查tokenized数据集样本...")
+    sample = tokenized_dataset[0]
+    print(f"样本字段: {list(sample.keys())}")
+    print(f"input_ids长度: {len(sample['input_ids'])}")
+    print(f"labels长度: {len(sample['labels'])}")
     
     if len(tokenized_dataset) > 10:
         train_test_split = tokenized_dataset.train_test_split(test_size=0.1, seed=42)
@@ -159,19 +172,20 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
         train_dataset = tokenized_dataset
         eval_dataset = None
     
-    # 优化：调整训练参数以更好利用GPU和CPU
+    # 修复：减少dataloader worker数量避免多进程问题
+    cpu_count = os.cpu_count()
     training_args = TrainingArguments(
         output_dir=output_dir,
         overwrite_output_dir=True,
         num_train_epochs=3,
-        per_device_train_batch_size=2,  # 增加批处理大小
-        per_device_eval_batch_size=2,
-        gradient_accumulation_steps=8,  # 相应减少梯度累积步骤
+        per_device_train_batch_size=1,  # 修复：减少批处理大小
+        per_device_eval_batch_size=1,
+        gradient_accumulation_steps=16,  # 增加梯度累积来补偿小批次
         warmup_steps=100,
         learning_rate=5e-5,
         weight_decay=0.01,
         bf16=torch.cuda.is_available(),
-        fp16=False,  # 避免与bf16冲突
+        fp16=False,
         logging_steps=10,
         logging_dir=f'{output_dir}/logs',
         eval_strategy="steps" if eval_dataset else "no",
@@ -181,25 +195,22 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
         load_best_model_at_end=True if eval_dataset else False,
         metric_for_best_model="eval_loss" if eval_dataset else None,
         report_to=None,
-        dataloader_pin_memory=True,
-        dataloader_num_workers=max(2, cpu_count // 2),  # 优化数据加载器工作进程数
+        dataloader_pin_memory=False,  # 修复：禁用pin_memory避免问题
+        dataloader_num_workers=0,  # 修复：设为0避免多进程问题
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={'use_reentrant': False},
         remove_unused_columns=True,
         ddp_find_unused_parameters=False,
-        # 优化：添加更多性能优化选项
-        dataloader_persistent_workers=True,  # 保持工作进程活跃
-        dataloader_prefetch_factor=2,  # 预取因子
-        max_grad_norm=1.0,  # 梯度裁剪
-        lr_scheduler_type="cosine",  # 使用余弦学习率调度
-        warmup_ratio=0.1,  # 预热比例
+        max_grad_norm=1.0,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.1,
     )
     
-    # 优化：数据整理器配置
+    # 修复：使用更简单的数据整理器配置
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=False,
-        pad_to_multiple_of=8,
+        pad_to_multiple_of=None,  # 修复：设为None避免padding问题
         return_tensors="pt",
     )
     
