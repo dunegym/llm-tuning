@@ -39,18 +39,18 @@ def load_and_prepare_data(xlsx_path, tokenizer):
     return texts
 
 def tokenize_function(examples, tokenizer, max_length=2048):
-    """数据tokenization"""
-    # 对文本进行tokenization
+    """数据tokenization - 修复batch处理问题"""
+    # 对文本进行tokenization，不返回tensor
     tokenized = tokenizer(
         examples['text'],
         truncation=True,
-        padding=False,  # 使用dynamic padding
+        padding=False,  # 先不padding，让data collator处理
         max_length=max_length,
-        return_tensors='pt'
+        return_tensors=None  # 不返回tensor，返回list
     )
     
-    # 对于因果语言模型，标签就是输入的shifted版本
-    tokenized['labels'] = tokenized['input_ids'].clone()
+    # 对于因果语言模型，标签就是输入的copy
+    tokenized['labels'] = tokenized['input_ids'].copy()
     
     return tokenized
 
@@ -120,7 +120,7 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
     # 打印可训练参数数量
     model.print_trainable_parameters()
     
-    # 5. Tokenize数据
+    # 5. Tokenize数据 - 修改为不使用batched处理
     print("处理数据...")
     def tokenize_function_wrapper(examples):
         return tokenize_function(examples, tokenizer, max_length=2048)
@@ -128,7 +128,9 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
     tokenized_dataset = dataset.map(
         tokenize_function_wrapper, 
         batched=True,
-        remove_columns=dataset.column_names
+        batch_size=1000,  # 减小batch size
+        remove_columns=dataset.column_names,
+        desc="Tokenizing dataset"
     )
     
     # 6. 分割训练和验证集
@@ -166,7 +168,7 @@ def fine_tune_model(xlsx_path, model_path="/model/ModelScope/Qwen/Qwen3-8B", out
         remove_unused_columns=False,
     )
     
-    # 8. 设置数据整理器
+    # 8. 设置数据整理器 - 这里会处理padding
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=False,
